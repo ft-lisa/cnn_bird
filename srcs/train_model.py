@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import random
+
 import shutil
-from collections.abc import Iterable
+
 from pathlib import Path
-from collections import Counter
 
 import torch
 from PIL import Image
@@ -61,30 +60,30 @@ class BirdImageDataset(Dataset):
         return converted_image, label
 
 
-class SimpleBirdCNN(nn.Module):
-    def __init__(self, num_classes: int) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 128),
-            nn.ReLU(inplace=True),
-            # nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-        )
+# class SimpleBirdCNN(nn.Module):
+#     def __init__(self, num_classes: int) -> None:
+#         super().__init__()
+#         self.features = nn.Sequential(
+#             nn.Conv2d(3, 32, kernel_size=3, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.MaxPool2d(kernel_size=2),
+#             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.MaxPool2d(kernel_size=2),
+#             nn.Conv2d(64, 128, kernel_size=3, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.AdaptiveAvgPool2d((1, 1)),
+#         )
+#         self.classifier = nn.Sequential(
+#             nn.Flatten(),
+#             nn.Linear(128, 128),
+#             nn.ReLU(inplace=True),
+#             # nn.Dropout(0.3),
+#             nn.Linear(128, num_classes),
+#         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.features(inputs))
+#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+#         return self.classifier(self.features(inputs))
 
 
 
@@ -115,25 +114,27 @@ class BirdCNN(nn.Module):
 def train_model() -> None:
     project_root = Path(__file__).resolve().parents[1]
     source_dir = project_root / "augmented_results"
-    split_dir = project_root / "dataset_split"
-    train_dir = split_dir / "train"
-    stats_dir = split_dir / "stats"
+    train_dir = source_dir / "train"
+    stats_dir = source_dir / "stats"
     checkpoint_path = project_root / "bird_cnn.pth"
 
     if not source_dir.exists():
         print(f"Dataset directory not found: {source_dir}")
         return
 
-    species_dirs = sorted(path for path in source_dir.iterdir() if path.is_dir() and path.name.endswith("_images"))
+    species_dirs = sorted(
+        path for path in train_dir.iterdir()
+        if path.is_dir() and path.name.endswith("_images")
+    )
     if not species_dirs:
-        print(f"No species folders found in {source_dir}")
+        print(f"No species folders found in {train_dir}")
         return
 
     train_dir.mkdir(parents=True, exist_ok=True)
     stats_dir.mkdir(parents=True, exist_ok=True)
 
-    split_summary = split_dataset(species_dirs, train_dir, stats_dir, seed=42)
-    print("Dataset split completed (90% train / 10% stats):")
+    # split_summary = split_dataset(species_dirs, train_dir, stats_dir, seed=42)
+    # print("Dataset split completed (90% train / 10% stats):")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
@@ -144,9 +145,6 @@ def train_model() -> None:
     # Augmentation forte côté train pour compenser le peu de données
     train_transforms = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
     ])
@@ -170,8 +168,15 @@ def train_model() -> None:
     num_classes = len(train_dataset.idx_to_class)
     model = BirdCNN(num_classes=num_classes, freeze_backbone=True).to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    stats_loader = DataLoader(stats_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=128,
+        shuffle=True,
+        num_workers=4,        # ← charge les images en parallèle (essaie 4-8)
+        pin_memory=True,      # ← accélère le transfert CPU→GPU
+        persistent_workers=True,  # ← évite de recréer les workers à chaque epoch
+    )
+    stats_loader = DataLoader(stats_dataset, batch_size=128, shuffle=False)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -185,9 +190,11 @@ def train_model() -> None:
     epochs_without_improvement = 0
     patience = 10
 
+    scaler = torch.amp.GradScaler('cuda')
+
     print("=== Phase 1 : entraînement de la tête (backbone gelé) ===")
-    for epoch in range(1, 5):
-        train_loss, train_accuracy = run_training_epoch(model, train_loader, criterion, optimizer, device)
+    for epoch in range(1, 15):
+        train_loss, train_accuracy = run_training_epoch(model, train_loader, criterion, optimizer, device, scaler)
         stats_loss, stats_accuracy = evaluate(model, stats_loader, criterion, device)
         print(
             f"[Phase 1] Epoch {epoch} - train loss: {train_loss:.4f} - train acc: {train_accuracy:.2%} - stats loss: {stats_loss:.4f} - stats acc: {stats_accuracy:.2%}"
@@ -219,8 +226,8 @@ def train_model() -> None:
     epochs_without_improvement = 0
     patience = 15
 
-    for epoch in range(1, 500 + 1):
-        train_loss, train_accuracy = run_training_epoch(model, train_loader, criterion, optimizer, device)
+    for epoch in range(1, 30):
+        train_loss, train_accuracy = run_training_epoch(model, train_loader, criterion, optimizer, device, scaler)
         stats_loss, stats_accuracy = evaluate(model, stats_loader, criterion, device)
         print(
             f"[Phase 2] Epoch {epoch} - train loss: {train_loss:.4f} - train acc: {train_accuracy:.2%} - stats loss: {stats_loss:.4f} - stats acc: {stats_accuracy:.2%}"
@@ -242,48 +249,6 @@ def train_model() -> None:
     print(f"Model saved to {checkpoint_path}")
 
 
-def split_dataset(
-    species_dirs: Iterable[Path],
-    train_dir: Path,
-    stats_dir: Path,
-    seed: int,
-) -> dict[str, dict[str, int]]:
-    random_generator = random.Random(seed)
-    summary: dict[str, dict[str, int]] = {}
-
-    for species_dir in species_dirs:
-        species_name = species_dir.name.removesuffix("_images")
-        image_paths = sorted(
-            path
-            for path in species_dir.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in BirdImageDataset.allowed_extensions
-        )
-
-        if not image_paths:
-            summary[species_name] = {"train": 0, "stats": 0}
-            continue
-
-        shuffled_paths = image_paths[:]
-        random_generator.shuffle(shuffled_paths)
-
-        stats_count = max(1, round(len(shuffled_paths) * 0.1)) if len(shuffled_paths) > 1 else 0
-        stats_count = min(stats_count, len(shuffled_paths) - 1) if len(shuffled_paths) > 1 else 0
-        stats_paths = shuffled_paths[:stats_count]
-        train_paths = shuffled_paths[stats_count:]
-
-        copy_images(train_paths, train_dir / species_dir.name)
-        copy_images(stats_paths, stats_dir / species_dir.name)
-
-        summary[species_name] = {"train": len(train_paths), "stats": len(stats_paths)}
-
-    return summary
-
-
-def copy_images(source_paths: list[Path], destination_dir: Path) -> None:
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    for source_path in source_paths:
-        shutil.copy2(source_path, destination_dir / source_path.name)
 
 
 def run_training_epoch(
@@ -292,6 +257,7 @@ def run_training_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: torch.cuda.amp.GradScaler,
 ) -> tuple[float, float]:
 
     model.train()
@@ -307,13 +273,13 @@ def run_training_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        outputs = model(images)
+        with torch.amp.autocast('cuda'):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
-        loss = criterion(outputs, labels)
-
-        loss.backward()
-
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # Loss
         running_loss += loss.item() * images.size(0)

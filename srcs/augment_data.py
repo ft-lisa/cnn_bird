@@ -1,6 +1,9 @@
 import random
 import shutil
 from pathlib import Path
+from collections.abc import Iterable
+import random
+
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
@@ -12,7 +15,7 @@ class DatasetAugmenter:
         self,
         results_dir: Path | None = None,
         output_dir: Path | None = None,
-        target_count: int = 1000,
+        target_count: int = 5000,
     ) -> None:
         self.results_dir = results_dir or Path(__file__).resolve().parents[1] / "results"
         self.output_dir = output_dir or Path(__file__).resolve().parents[1] / "augmented_results"
@@ -40,29 +43,34 @@ class DatasetAugmenter:
         return len(self.list_image_files(image_directory))
 
     def augment_all_species(self) -> None:
-        image_directories = self.get_species_image_directories()
+        train_dir = self.output_dir / "train"
+        stats_dir = self.output_dir / "stats"
+
+        image_directories = self.get_species_image_directories()  # scan self.results_dir (dataset original)
 
         if not image_directories:
             print(f"No species image folders found in {self.results_dir}")
             return
 
-        for image_directory in image_directories:
-            species_name = image_directory.name.removesuffix("_images")
-            created_photos = self.augment_species_folder(image_directory, species_name)
-            final_count = self.count_photos(self.get_output_species_directory(species_name))
-            print(f"{species_name}: {final_count} photos in {self.output_dir.name} (+{created_photos} created)")
+        self.split_dataset(image_directories, train_dir, stats_dir, 42)
 
-    def augment_species_folder(self, image_directory: Path, species_name: str) -> int:
-        source_images = self.list_image_files(image_directory)
+        # Augmentation uniquement sur train — stats reste intact pour une évaluation fiable
+        for species_directory in sorted(train_dir.iterdir()):
+            if not species_directory.is_dir():
+                continue
+            species_name = species_directory.name.removesuffix("_images")
+            created_photos = self.augment_species_folder(species_directory, species_name)
+            final_count = self.count_photos(species_directory)
+            print(f"{species_name}: {final_count} photos in train (+{created_photos} created)")
+
+
+    def augment_species_folder(self, species_directory: Path, species_name: str) -> int:
+        source_images = self.list_image_files(species_directory)
 
         if not source_images:
             return 0
 
-        output_species_directory = self.get_output_species_directory(species_name)
-        output_species_directory.mkdir(parents=True, exist_ok=True)
-        self.copy_original_images(source_images, output_species_directory)
-
-        current_count = self.count_photos(output_species_directory)
+        current_count = self.count_photos(species_directory)
         if current_count >= self.target_count:
             return 0
 
@@ -75,12 +83,60 @@ class DatasetAugmenter:
 
             with Image.open(source_image) as original_image:
                 augmented_image = self.create_augmented_image(original_image)
-                output_path = self.build_output_path(output_species_directory, source_image, current_count + created_count + 1)
+                output_path = self.build_output_path(
+                    species_directory, source_image, current_count + created_count + 1
+                )
                 self.save_image(augmented_image, output_path)
 
             created_count += 1
 
         return created_count
+    
+
+    def split_dataset(
+    self,
+    species_dirs: Iterable[Path],
+    train_dir: Path,
+    stats_dir: Path,
+    seed: int,
+    ) -> dict[str, dict[str, int]]:
+        random_generator = random.Random(seed)
+        summary: dict[str, dict[str, int]] = {}
+
+        for species_dir in species_dirs:
+            species_name = species_dir.name.removesuffix("_images")
+            image_paths = sorted(
+                path
+                for path in species_dir.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in self.allowed_extensions
+            )
+
+            if not image_paths:
+                summary[species_name] = {"train": 0, "stats": 0}
+                continue
+
+            shuffled_paths = image_paths[:]
+            random_generator.shuffle(shuffled_paths)
+
+            stats_count = max(1, round(len(shuffled_paths) * 0.1)) if len(shuffled_paths) > 1 else 0
+            stats_count = min(stats_count, len(shuffled_paths) - 1) if len(shuffled_paths) > 1 else 0
+            stats_paths = shuffled_paths[:stats_count]
+            train_paths = shuffled_paths[stats_count:]
+
+            self.copy_images(train_paths, train_dir / species_dir.name)
+            self.copy_images(stats_paths, stats_dir / species_dir.name)
+
+            summary[species_name] = {"train": len(train_paths), "stats": len(stats_paths)}
+
+        return summary
+
+    
+    def copy_images(self, source_paths: list[Path], destination_dir: Path) -> None:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for source_path in source_paths:
+            shutil.copy2(source_path, destination_dir / source_path.name)
+
 
     def copy_original_images(self, source_images: list[Path], output_directory: Path) -> None:
         for source_image in source_images:

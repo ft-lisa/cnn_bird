@@ -3,6 +3,10 @@ from argparse import ArgumentParser
 from augment_data import augment_data
 from predict_species import predict_species
 from train_model import train_model
+from pathlib import Path
+
+MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "bird_cnn.pth"
+
 
 
 def build_parser() -> ArgumentParser:
